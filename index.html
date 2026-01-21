@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Red Dot Background</title>
+<style>
+    body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #ffffff; cursor: none; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #cursor { position: fixed; top: 0; left: 0; z-index: 9999; pointer-events: none; display: none; }
+    #dot { 
+        width: 20px; height: 20px; 
+        background: #000; 
+        border-radius: 50%; 
+        transform: translate(-50%, -50%); 
+        transition: transform 0.15s ease-out; 
+    }
+    #cursor.active #dot { transform: translate(-50%, -50%) scale(0.5); }
+</style>
+<link rel="stylesheet" href="/index.css">
+</head>
+<body>
+<div id="cursor"><div id="dot"></div></div>
+<canvas id="c"></canvas>
+<script>
+(function() {
+    // --- SETUP ---
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const cursor = document.getElementById('cursor');
+
+    // Config
+    const SPACING = 7, CHUNK_SIZE = 16, SPACING_CHUNK = SPACING * CHUNK_SIZE;
+    const MOUSE_RADIUS = 300, MOUSE_RADIUS_SQ = 90000, INV_MOUSE_RADIUS = 1/300;
+    const DOT_RADIUS = 400, DOT_RADIUS_SQ = 160000, INV_DOT_RADIUS = 1/400, CHECK_RADIUS = 450;
+    const BLUE_RADIUS = 32, BLUE_DIAMETER_SQ = 4096, INITIAL_SPEED = 0.8;
+    const EASING_IDLE = 0.25, EASING_ACTIVE = 0.5, LERP_GATHER = 0.25, LERP_RETURN = 0.12;
+    const C_START = {r:255,g:255,b:255}, C_END = {r:20,g:80,b:180}, C_HALO = {r:0,g:71,b:171};
+    
+    const STATIC_HALO_COLOR = `rgba(${C_HALO.r}, ${C_HALO.g}, ${C_HALO.b}, 0.25)`;
+    const STATIC_LINE_COLOR = `rgba(${C_END.r}, ${C_END.g}, ${C_END.b}, 0.15)`;
+
+    // State
+    let width, height, cols, rows, chunkCols, chunkRows;
+    let gridSizes, chunkActive, baseSize;
+    let mouseX = -10000, mouseY = -10000;
+    let staticCanvas = null;
+
+    // Particles
+    const COUNT = 4;
+    const elX = new Float32Array(COUNT), elY = new Float32Array(COUNT);
+    const elVX = new Float32Array(COUNT), elVY = new Float32Array(COUNT);
+    const elType = new Uint8Array(COUNT), elAngle = new Float32Array(COUNT);
+    const pState = new Uint8Array(COUNT); 
+    const saveX = new Float32Array(COUNT), saveY = new Float32Array(COUNT);
+    const saveVX = new Float32Array(COUNT), saveVY = new Float32Array(COUNT);
+    const triVerts = new Float32Array(COUNT * 6), triAreas = new Float32Array(COUNT);
+
+    // Cache
+    const BUCKET_COUNT = 10;
+    const colorCache = [], haloColorCache = [];
+    for(let i=0; i<BUCKET_COUNT; i++) {
+        const t = i/(BUCKET_COUNT-1);
+        const r = Math.round(C_START.r + (C_END.r-C_START.r)*t);
+        const g = Math.round(C_START.g + (C_END.g-C_START.g)*t);
+        const b = Math.round(C_START.b + (C_END.b-C_START.b)*t);
+        colorCache[i] = `rgb(${r},${g},${b})`;
+        haloColorCache[i] = `rgba(${C_HALO.r},${C_HALO.g},${C_HALO.b},0.25)`;
+    }
+
+    // Helpers
+    const distToSegmentSq = (px, py, vx, vy, wx, wy) => {
+        const l2 = (wx-vx)**2 + (wy-vy)**2;
+        if(l2===0) return (px-vx)**2 + (py-vy)**2;
+        let t = ((px-vx)*(wx-vx) + (py-vy)*(wy-vy)) / l2;
+        if(t<0) t=0; else if(t>1) t=1;
+        return (px-(vx+t*(wx-vx)))**2 + (py-(vy+t*(wy-vy)))**2;
+    };
+
+    // Init Particles
+    const cx = window.innerWidth/2, cy = window.innerHeight/2;
+    const dirs = [[-1,-1],[1,-1],[-1,1],[1,1]];
+    for(let i=0; i<COUNT; i++) {
+        elX[i] = cx + dirs[i][0]*60; elY[i] = cy + dirs[i][1]*60;
+        elVX[i] = dirs[i][0]*INITIAL_SPEED + (Math.random()-0.5);
+        elVY[i] = dirs[i][1]*INITIAL_SPEED + (Math.random()-0.5);
+        elType[i] = i%2;
+        elAngle[i] = Math.random()*6.28;
+    }
+
+    // Optimize: Use Pattern instead of Loop
+    const drawStatic = (ctx, w, h) => {
+        // Create a small tile for the pattern
+        const t = document.createElement('canvas');
+        t.width = SPACING;
+        t.height = SPACING;
+        const c = t.getContext('2d');
+        const center = SPACING/2;
+
+        // 1. Background
+        c.fillStyle = '#ffffff'; 
+        c.fillRect(0,0,SPACING,SPACING);
+        
+        // 2. Lines (Cross)
+        c.beginPath(); 
+        c.strokeStyle = STATIC_LINE_COLOR; 
+        c.lineWidth = 1;
+        // Horizontal line through center
+        c.moveTo(0, center); c.lineTo(SPACING, center);
+        // Vertical line through center
+        c.moveTo(center, 0); c.lineTo(center, SPACING);
+        c.stroke();
+
+        // 3. Halo
+        const idleS = SPACING*0.35;
+        const idleHalo = idleS*2.8;
+        c.beginPath(); 
+        c.fillStyle = STATIC_HALO_COLOR;
+        c.arc(center, center, idleHalo/2, 0, 6.283);
+        c.fill();
+
+        // 4. Dot
+        c.beginPath(); 
+        c.fillStyle = colorCache[BUCKET_COUNT-1];
+        c.arc(center, center, idleS/2, 0, 6.283);
+        c.fill();
+
+        // Fill main canvas with pattern
+        ctx.fillStyle = ctx.createPattern(t, 'repeat');
+        ctx.fillRect(0, 0, w, h);
+    };
+
+    const resize = () => {
+        width = window.innerWidth; height = window.innerHeight;
+        canvas.width = width; canvas.height = height;
+        cols = Math.ceil(width/SPACING); rows = Math.ceil(height/SPACING);
+        baseSize = SPACING*0.35;
+        gridSizes = new Float32Array(cols*rows).fill(baseSize);
+        chunkCols = Math.ceil(cols/CHUNK_SIZE); chunkRows = Math.ceil(rows/CHUNK_SIZE);
+        chunkActive = new Uint8Array(chunkCols*chunkRows).fill(0);
+        
+        staticCanvas = document.createElement('canvas');
+        staticCanvas.width = width; staticCanvas.height = height;
+        // Optimized call: No need for cols/rows loops
+        drawStatic(staticCanvas.getContext('2d',{alpha:false}), width, height);
+    };
+
+    // Reusable Arrays
+    const dynamicBuckets = Array.from({length:BUCKET_COUNT}, ()=>[]);
+    const lineBucket = [];
+
+    const loop = () => {
+        if(staticCanvas) ctx.drawImage(staticCanvas, 0, 0);
+        else { ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,width,height); }
+
+        let isAnyGathering = false;
+        const wBound = width - BLUE_RADIUS, hBound = height - BLUE_RADIUS;
+
+        // --- Physics ---
+        for(let i=0; i<COUNT; i++) {
+            const s = pState[i];
+            if(s===1) isAnyGathering = true;
+            if(s===0) {
+                elX[i]+=elVX[i]; elY[i]+=elVY[i];
+                if(elX[i]<BLUE_RADIUS) { elX[i]=BLUE_RADIUS; elVX[i]*=-1; }
+                else if(elX[i]>wBound) { elX[i]=wBound; elVX[i]*=-1; }
+                if(elY[i]<BLUE_RADIUS) { elY[i]=BLUE_RADIUS; elVY[i]*=-1; }
+                else if(elY[i]>hBound) { elY[i]=hBound; elVY[i]*=-1; }
+                
+                for(let j=i+1; j<COUNT; j++) {
+                    if(pState[j]!==0) continue;
+                    const dx=elX[j]-elX[i], dy=elY[j]-elY[i];
+                    const d2=dx*dx+dy*dy;
+                    if(d2<BLUE_DIAMETER_SQ) {
+                        const dist=Math.sqrt(d2), overlap=(64-dist)*0.5;
+                        const nx=dx/dist, ny=dy/dist;
+                        elX[i]-=nx*overlap; elY[i]-=ny*overlap;
+                        elX[j]+=nx*overlap; elY[j]+=ny*overlap;
+                        const tx=-ny, ty=nx;
+                        const dpTan1=elVX[i]*tx+elVY[i]*ty, dpNorm1=elVX[i]*nx+elVY[i]*ny;
+                        const dpTan2=elVX[j]*tx+elVY[j]*ty, dpNorm2=elVX[j]*nx+elVY[j]*ny;
+                        elVX[i]=tx*dpTan1+nx*dpNorm2; elVY[i]=ty*dpTan1+ny*dpNorm2;
+                        elVX[j]=tx*dpTan2+nx*dpNorm1; elVY[j]=ty*dpTan2+ny*dpNorm1;
+                    }
+                }
+            } else if(s===1) {
+                elX[i]+=(mouseX-elX[i])*LERP_GATHER; elY[i]+=(mouseY-elY[i])*LERP_GATHER;
+            } else if(s===2) {
+                const tx=saveX[i], ty=saveY[i];
+                elX[i]+=(tx-elX[i])*LERP_RETURN; elY[i]+=(ty-elY[i])*LERP_RETURN;
+                if((tx-elX[i])**2+(ty-elY[i])**2 < 1.0) {
+                    elX[i]=tx; elY[i]=ty; elVX[i]=saveVX[i]; elVY[i]=saveVY[i]; pState[i]=0;
+                }
+            }
+            if(elType[i]===1) {
+                elAngle[i]+=0.05;
+                const a=elAngle[i], b=i*6, r=BLUE_RADIUS;
+                const v1x=elX[i]+r*Math.cos(a), v1y=elY[i]+r*Math.sin(a);
+                const v2x=elX[i]+r*Math.cos(a+2.09), v2y=elY[i]+r*Math.sin(a+2.09);
+                const v3x=elX[i]+r*Math.cos(a+4.18), v3y=elY[i]+r*Math.sin(a+4.18);
+                triVerts[b]=v1x; triVerts[b+1]=v1y; triVerts[b+2]=v2x; triVerts[b+3]=v2y; triVerts[b+4]=v3x; triVerts[b+5]=v3y;
+                triAreas[i]=Math.abs((v2x-v1x)*(v3y-v1y)-(v3x-v1x)*(v2y-v1y));
+            }
+        }
+
+        const currentEasing = isAnyGathering ? EASING_ACTIVE : EASING_IDLE;
+        const influenceRad = DOT_RADIUS + SPACING_CHUNK;
+        const mouseWakeDistSq = (MOUSE_RADIUS+200)**2;
+
+        // --- Render ---
+        for(let b=0; b<BUCKET_COUNT; b++) dynamicBuckets[b].length=0;
+        lineBucket.length=0;
+
+        for(let cy=0; cy<chunkRows; cy++) {
+            const chunkYPx = cy*SPACING_CHUNK;
+            const chunkCenterY = chunkYPx+SPACING_CHUNK/2;
+            for(let cx=0; cx<chunkCols; cx++) {
+                const idxChunk = cy*chunkCols+cx;
+                const chunkXPx = cx*SPACING_CHUNK;
+                const chunkCenterX = chunkXPx+SPACING_CHUNK/2;
+                
+                let forceWake = false;
+                let activeEffectorsMask = 0;
+                
+                const dxM = mouseX-chunkCenterX, dyM = mouseY-chunkCenterY;
+                const distSqM = dxM*dxM+dyM*dyM;
+                if(distSqM < mouseWakeDistSq) {
+                    forceWake = true;
+                    if(distSqM < (MOUSE_RADIUS+SPACING_CHUNK)**2) activeEffectorsMask |= 1;
+                }
+                
+                for(let k=0; k<COUNT; k++) {
+                    const dxP = elX[k]-chunkCenterX, dyP = elY[k]-chunkCenterY;
+                    if(Math.abs(dxP)<influenceRad && Math.abs(dyP)<influenceRad) {
+                        forceWake = true; activeEffectorsMask |= (1<<(k+1));
+                    }
+                }
+
+                if(forceWake) chunkActive[idxChunk]=1;
+                if(chunkActive[idxChunk]===0) continue;
+
+                const cStart=cx*CHUNK_SIZE, cEnd=Math.min(cStart+CHUNK_SIZE, cols);
+                const rStart=cy*CHUNK_SIZE, rEnd=Math.min(rStart+CHUNK_SIZE, rows);
+                let allIdle = true;
+                
+                // Clear Chunk Area
+                ctx.fillStyle='#ffffff'; ctx.fillRect(chunkXPx, chunkYPx, SPACING_CHUNK, SPACING_CHUNK);
+
+                for(let i=cStart; i<cEnd; i++) {
+                    const x = i*SPACING+SPACING/2;
+                    const dxM_col = mouseX-x;
+                    const nearMouseX = (activeEffectorsMask&1) && Math.abs(dxM_col)<MOUSE_RADIUS;
+
+                    for(let j=rStart; j<rEnd; j++) {
+                        const idx = i*rows+j;
+                        const y = j*SPACING+SPACING/2;
+                        let minFactor = 1.0;
+
+                        if(activeEffectorsMask!==0) {
+                            if(nearMouseX) {
+                                const dyM_local = mouseY-y;
+                                if(Math.abs(dyM_local)<MOUSE_RADIUS) {
+                                    const d2 = dxM_col*dxM_col + dyM_local*dyM_local;
+                                    if(d2<MOUSE_RADIUS_SQ) {
+                                        const f = Math.sqrt(d2)*INV_MOUSE_RADIUS;
+                                        if(f<minFactor) minFactor=f;
+                                    }
+                                }
+                            }
+                            if(minFactor>0.05) {
+                                for(let k=0; k<COUNT; k++) {
+                                    if(activeEffectorsMask & (1<<(k+1))) {
+                                        if(Math.abs(elX[k]-x)<CHECK_RADIUS && Math.abs(elY[k]-y)<CHECK_RADIUS) {
+                                            if(elType[k]===0) {
+                                                const dx=elX[k]-x, dy=elY[k]-y;
+                                                const d2=dx*dx+dy*dy;
+                                                if(d2<DOT_RADIUS_SQ) {
+                                                    const f=Math.sqrt(d2)*INV_DOT_RADIUS;
+                                                    if(f<minFactor) minFactor=f;
+                                                }
+                                            } else {
+                                                const b=k*6;
+                                                const v1x=triVerts[b], v1y=triVerts[b+1];
+                                                const v2x=triVerts[b+2], v2y=triVerts[b+3];
+                                                const v3x=triVerts[b+4], v3y=triVerts[b+5];
+                                                const areaOrig=triAreas[k];
+                                                const area1=Math.abs((v1x-x)*(v2y-y)-(v2x-x)*(v1y-y));
+                                                const area2=Math.abs((v2x-x)*(v3y-y)-(v3x-x)*(v2y-y));
+                                                const area3=Math.abs((v3x-x)*(v1y-y)-(v1x-x)*(v3y-y));
+                                                if(Math.abs(area1+area2+area3-areaOrig)<1.0) minFactor=0;
+                                                else {
+                                                    let m=distToSegmentSq(x,y,v1x,v1y,v2x,v2y);
+                                                    const m2=distToSegmentSq(x,y,v2x,v2y,v3x,v3y);
+                                                    if(m2<m) m=m2;
+                                                    const m3=distToSegmentSq(x,y,v3x,v3y,v1x,v1y);
+                                                    if(m3<m) m=m3;
+                                                    if(m<DOT_RADIUS_SQ) {
+                                                        const f=Math.sqrt(m)*INV_DOT_RADIUS;
+                                                        if(f<minFactor) minFactor=f;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        const targetSize = baseSize*minFactor;
+                        let s = gridSizes[idx];
+                        if(Math.abs(s-targetSize)>0.05) { s+=(targetSize-s)*currentEasing; gridSizes[idx]=s; allIdle=false; }
+                        else { s=targetSize; gridSizes[idx]=targetSize; if(Math.abs(s-baseSize)>0.05) allIdle=false; }
+
+                        const fRatio = s/baseSize;
+                        let bIdx = Math.floor(fRatio*(BUCKET_COUNT-1));
+                        if(bIdx<0) bIdx=0; else if(bIdx >= BUCKET_COUNT) bIdx=BUCKET_COUNT-1;
+                        dynamicBuckets[bIdx].push(idx);
+                        lineBucket.push(idx);
+                    }
+                }
+                if(allIdle && !forceWake) chunkActive[idxChunk]=0;
+            }
+        }
+
+        ctx.beginPath(); ctx.strokeStyle=STATIC_LINE_COLOR; ctx.lineWidth=1;
+        for(let k=0; k<lineBucket.length; k++) {
+            const idx=lineBucket[k], i=(idx/rows)|0, j=idx%rows;
+            const x=i*SPACING+SPACING/2, y=j*SPACING+SPACING/2;
+            if(i<cols-1) { ctx.moveTo(x,y); ctx.lineTo(x+SPACING,y); }
+            if(j<rows-1) { ctx.moveTo(x,y); ctx.lineTo(x,y+SPACING); }
+            if(i>0) { ctx.moveTo(x-SPACING,y); ctx.lineTo(x,y); }
+            if(j>0) { ctx.moveTo(x,y-SPACING); ctx.lineTo(x,y); }
+        }
+        ctx.stroke();
+
+        for(let b=0; b<BUCKET_COUNT; b++) {
+            const idxs=dynamicBuckets[b], len=idxs.length;
+            if(len===0) continue;
+            ctx.beginPath(); ctx.fillStyle=haloColorCache[b];
+            for(let k=0; k<len; k++) {
+                const idx=idxs[k], s=gridSizes[idx], f=s/baseSize;
+                const fHalo = Math.max(0, 1-(1-f)*1.5);
+                if(s>0.1 && fHalo>0) {
+                    const hs = baseSize*2.8*fHalo;
+                    const i=(idx/rows)|0, j=idx%rows;
+                    const x=i*SPACING+SPACING/2, y=j*SPACING+SPACING/2;
+                    ctx.moveTo(x+hs/2,y); ctx.arc(x,y,hs/2,0,6.283);
+                }
+            }
+            ctx.fill();
+            ctx.beginPath(); ctx.fillStyle=colorCache[b];
+            for(let k=0; k<len; k++) {
+                const idx=idxs[k], s=gridSizes[idx];
+                if(s>0.5) {
+                    const i=(idx/rows)|0, j=idx%rows;
+                    const x=i*SPACING+SPACING/2, y=j*SPACING+SPACING/2;
+                    ctx.moveTo(x+s/2,y); ctx.arc(x,y,s/2,0,6.283);
+                }
+            }
+            ctx.fill();
+        }
+        requestAnimationFrame(loop);
+    };
+
+    window.onresize = resize;
+    window.onmousemove = e => { 
+        mouseX = e.clientX; 
+        mouseY = e.clientY; 
+        // Update Custom Cursor
+        cursor.style.transform = `translate3d(${mouseX}px, ${mouseY}px, 0)`;
+        cursor.style.display = 'block';
+    };
+    window.onmousedown = e => { 
+        if(e.button===0) {
+            cursor.classList.add('active');
+            for(let i=0; i<COUNT; i++) {
+                if(pState[i]===0) { saveX[i]=elX[i]; saveY[i]=elY[i]; saveVX[i]=elVX[i]; saveVY[i]=elVY[i]; }
+                pState[i]=1;
+            }
+        }
+    };
+    window.onmouseup = () => { 
+        cursor.classList.remove('active');
+        for(let i=0; i<COUNT; i++) if(pState[i]===1) pState[i]=2; 
+    };
+
+    resize();
+    loop();
+})();
+</script>
+<script type="module" src="/index.tsx"></script>
+</body>
+</html>
