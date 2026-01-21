@@ -5,30 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Red Dot Background</title>
 <style>
-    body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #ffffff; cursor: none; }
-    canvas { display: block; width: 100%; height: 100%; }
-    #cursor { position: fixed; top: 0; left: 0; z-index: 9999; pointer-events: none; display: none; }
-    #dot { 
-        width: 20px; height: 20px; 
-        background: #000; 
-        border-radius: 50%; 
-        transform: translate(-50%, -50%); 
-        transition: transform 0.15s ease-out; 
-    }
-    #cursor.active #dot { transform: translate(-50%, -50%) scale(0.5); }
+    body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #ffffff; }
+    canvas { display: block; width: 100%; height: 100%; cursor: none; }
 </style>
 <link rel="stylesheet" href="/index.css">
 </head>
 <body>
-<div id="cursor"><div id="dot"></div></div>
 <canvas id="c"></canvas>
 <script>
 (function() {
     // --- SETUP ---
     const canvas = document.getElementById('c');
     const ctx = canvas.getContext('2d', { alpha: false });
-    const cursor = document.getElementById('cursor');
-
+    
     // Config
     const SPACING = 7, CHUNK_SIZE = 16, SPACING_CHUNK = SPACING * CHUNK_SIZE;
     const MOUSE_RADIUS = 300, MOUSE_RADIUS_SQ = 90000, INV_MOUSE_RADIUS = 1/300;
@@ -44,7 +33,7 @@
     let width, height, cols, rows, chunkCols, chunkRows;
     let gridSizes, chunkActive, baseSize;
     let mouseX = -10000, mouseY = -10000;
-    let staticCanvas = null;
+    let staticPattern = null;
 
     // Particles
     const COUNT = 4;
@@ -88,48 +77,6 @@
         elAngle[i] = Math.random()*6.28;
     }
 
-    // Optimize: Use Pattern instead of Loop
-    const drawStatic = (ctx, w, h) => {
-        // Create a small tile for the pattern
-        const t = document.createElement('canvas');
-        t.width = SPACING;
-        t.height = SPACING;
-        const c = t.getContext('2d');
-        const center = SPACING/2;
-
-        // 1. Background
-        c.fillStyle = '#ffffff'; 
-        c.fillRect(0,0,SPACING,SPACING);
-        
-        // 2. Lines (Cross)
-        c.beginPath(); 
-        c.strokeStyle = STATIC_LINE_COLOR; 
-        c.lineWidth = 1;
-        // Horizontal line through center
-        c.moveTo(0, center); c.lineTo(SPACING, center);
-        // Vertical line through center
-        c.moveTo(center, 0); c.lineTo(center, SPACING);
-        c.stroke();
-
-        // 3. Halo
-        const idleS = SPACING*0.35;
-        const idleHalo = idleS*2.8;
-        c.beginPath(); 
-        c.fillStyle = STATIC_HALO_COLOR;
-        c.arc(center, center, idleHalo/2, 0, 6.283);
-        c.fill();
-
-        // 4. Dot
-        c.beginPath(); 
-        c.fillStyle = colorCache[BUCKET_COUNT-1];
-        c.arc(center, center, idleS/2, 0, 6.283);
-        c.fill();
-
-        // Fill main canvas with pattern
-        ctx.fillStyle = ctx.createPattern(t, 'repeat');
-        ctx.fillRect(0, 0, w, h);
-    };
-
     const resize = () => {
         width = window.innerWidth; height = window.innerHeight;
         canvas.width = width; canvas.height = height;
@@ -139,10 +86,36 @@
         chunkCols = Math.ceil(cols/CHUNK_SIZE); chunkRows = Math.ceil(rows/CHUNK_SIZE);
         chunkActive = new Uint8Array(chunkCols*chunkRows).fill(0);
         
-        staticCanvas = document.createElement('canvas');
-        staticCanvas.width = width; staticCanvas.height = height;
-        // Optimized call: No need for cols/rows loops
-        drawStatic(staticCanvas.getContext('2d',{alpha:false}), width, height);
+        // Generate Static Pattern (O(1) startup instead of O(N))
+        const pCan = document.createElement('canvas');
+        pCan.width = SPACING; pCan.height = SPACING;
+        const pCtx = pCan.getContext('2d');
+        
+        // Background
+        pCtx.fillStyle = '#ffffff'; pCtx.fillRect(0,0,SPACING,SPACING);
+        
+        // Lines (Cross) - Matches the drawStatic grid logic
+        pCtx.beginPath(); pCtx.strokeStyle = STATIC_LINE_COLOR; pCtx.lineWidth = 1;
+        pCtx.moveTo(0, SPACING/2); pCtx.lineTo(SPACING, SPACING/2);
+        pCtx.moveTo(SPACING/2, 0); pCtx.lineTo(SPACING/2, SPACING);
+        pCtx.stroke();
+        
+        // Halo
+        const idleHalo = baseSize * 2.8;
+        pCtx.beginPath(); pCtx.fillStyle = STATIC_HALO_COLOR;
+        pCtx.arc(SPACING/2, SPACING/2, idleHalo/2, 0, 6.283);
+        pCtx.fill();
+        
+        // Dot
+        pCtx.beginPath(); pCtx.fillStyle = colorCache[BUCKET_COUNT-1];
+        pCtx.arc(SPACING/2, SPACING/2, baseSize/2, 0, 6.283);
+        pCtx.fill();
+        
+        staticPattern = ctx.createPattern(pCan, 'repeat');
+        
+        // Initial Fill
+        ctx.fillStyle = staticPattern;
+        ctx.fillRect(0,0,width,height);
     };
 
     // Reusable Arrays
@@ -150,9 +123,8 @@
     const lineBucket = [];
 
     const loop = () => {
-        if(staticCanvas) ctx.drawImage(staticCanvas, 0, 0);
-        else { ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,width,height); }
-
+        // NOTE: We do NOT clear the full screen here. We uses dirty rects for performance.
+        
         let isAnyGathering = false;
         const wBound = width - BLUE_RADIUS, hBound = height - BLUE_RADIUS;
 
@@ -243,7 +215,7 @@
                 const rStart=cy*CHUNK_SIZE, rEnd=Math.min(rStart+CHUNK_SIZE, rows);
                 let allIdle = true;
                 
-                // Clear Chunk Area
+                // Clear Chunk Area (This erases the static background to prepare for dynamic draw)
                 ctx.fillStyle='#ffffff'; ctx.fillRect(chunkXPx, chunkYPx, SPACING_CHUNK, SPACING_CHUNK);
 
                 for(let i=cStart; i<cEnd; i++) {
@@ -313,7 +285,7 @@
 
                         const fRatio = s/baseSize;
                         let bIdx = Math.floor(fRatio*(BUCKET_COUNT-1));
-                        if(bIdx<0) bIdx=0; else if(bIdx >= BUCKET_COUNT) bIdx=BUCKET_COUNT-1;
+                        if(bIdx<0) bIdx=0; else if(bIdx>=BUCKET_COUNT) bIdx=BUCKET_COUNT-1;
                         dynamicBuckets[bIdx].push(idx);
                         lineBucket.push(idx);
                     }
@@ -363,26 +335,14 @@
     };
 
     window.onresize = resize;
-    window.onmousemove = e => { 
-        mouseX = e.clientX; 
-        mouseY = e.clientY; 
-        // Update Custom Cursor
-        cursor.style.transform = `translate3d(${mouseX}px, ${mouseY}px, 0)`;
-        cursor.style.display = 'block';
-    };
+    window.onmousemove = e => { mouseX = e.clientX; mouseY = e.clientY; };
     window.onmousedown = e => { 
-        if(e.button===0) {
-            cursor.classList.add('active');
-            for(let i=0; i<COUNT; i++) {
-                if(pState[i]===0) { saveX[i]=elX[i]; saveY[i]=elY[i]; saveVX[i]=elVX[i]; saveVY[i]=elVY[i]; }
-                pState[i]=1;
-            }
+        if(e.button===0) for(let i=0; i<COUNT; i++) {
+            if(pState[i]===0) { saveX[i]=elX[i]; saveY[i]=elY[i]; saveVX[i]=elVX[i]; saveVY[i]=elVY[i]; }
+            pState[i]=1;
         }
     };
-    window.onmouseup = () => { 
-        cursor.classList.remove('active');
-        for(let i=0; i<COUNT; i++) if(pState[i]===1) pState[i]=2; 
-    };
+    window.onmouseup = () => { for(let i=0; i<COUNT; i++) if(pState[i]===1) pState[i]=2; };
 
     resize();
     loop();
